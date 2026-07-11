@@ -8,14 +8,16 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 
 ### Contract interface
 
-- **`create_stream(payer, recipient, rate_per_second, initial_balance, recipient_can_stop)`** — Create a new stream (payer must auth). Set `recipient_can_stop = true` to allow the recipient to also stop the stream; defaults to `false` (payer-only).
-- **`start_stream(stream_id)`** — Start an existing stream.
-- **`stop_stream(stream_id, stopper)`** — Stop an active stream. `stopper` must be the payer (always allowed) or the recipient (only when `recipient_can_stop` was set at creation). `stopper` must authorise the call.
-- **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
-- **`batch_settle(stream_ids)`** — Settle multiple streams in a single call; returns one settled amount per input id.
-- **`archive_stream(stream_id)`** — Remove a fully-settled, inactive stream from storage (payer must auth).
-- **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active, recipient_can_stop).
-- **`version()`** — Returns the contract version as a `u32` (no auth required).
+- **`create_stream(payer, recipient, token, rate_per_second, initial_balance)`** - Create and escrow a funded stream (payer must auth and approve token transfer).
+- **`start_stream(stream_id)`** - Start accrual for an inactive stream.
+- **`stop_stream(stream_id)`** - Payer-only stop that marks the stream inactive and records the final settlement boundary.
+- **`settle_stream(stream_id)`** - Permissionlessly move accrued value from `balance` into `claimable_balance`; returns the accrued amount.
+- **`batch_settle(stream_ids)`** - Settle up to 25 streams in a single all-or-nothing call.
+- **`withdraw_stream(stream_id)`** - Recipient-only withdrawal that implicitly settles and transfers all claimable tokens on-ledger.
+- **`pause_stream(stream_id)` / `resume_stream(stream_id)`** - Payer-only temporary pause controls distinct from final stop.
+- **`archive_stream(stream_id)`** - Remove a fully settled, fully withdrawn, inactive stream from storage (payer must auth).
+- **`get_stream_info(stream_id)`** - Read stream metadata, including token, balance, claimable balance, timestamps, and active state.
+- **`version()`** - Returns `VERSION = 2_000` as a `u32` (no auth required).
 
 ### Batch settlement semantics
 
@@ -194,6 +196,7 @@ MIT
 | Doc | Description |
 |---|---|
 | [`docs/timestamp-accrual.md`](docs/timestamp-accrual.md) | Ledger timestamp assumptions: validator behavior, coarse granularity, accrual edge cases, off-chain UX rounding |
+| [`docs/vesting.md`](docs/vesting.md) | Linear vesting formula, rounding behavior, and schedule-anchor semantics |
 | [`docs/error-codes.md`](docs/error-codes.md) | Canonical list of panic strings the contract can emit |
 | [`docs/glossary.md`](docs/glossary.md) | Definitions for terms used across the codebase and docs |
 | [`docs/local-development.md`](docs/local-development.md) | Contributor environment setup |

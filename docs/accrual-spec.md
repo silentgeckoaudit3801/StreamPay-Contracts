@@ -1,65 +1,68 @@
-# StreamPay — Formal Accrual Formula Specification
+# StreamPay - Accrual and Settlement Specification
 
-**Document:** `docs/accrual-spec.md`  
-**Contract:** `StreamPay-Contracts` (Soroban / Rust)  
-**Version:** 0.1.0 (`VERSION = 1_000`)  
-**Status:** Normative — matches `src/lib.rs` line-by-line
+**Document:** `docs/accrual-spec.md`
+**Contract:** `StreamPay-Contracts` (Soroban / Rust)
+**Version:** 0.2.0 (`VERSION = 2_000`)
+**Status:** Normative for the implemented `src/lib.rs` public surface
 
 ---
 
 ## 1. Overview
 
-A StreamPay stream is a continuous payment channel that accrues value from a
-`payer` to a `recipient` at a fixed `rate_per_second` (in the smallest token
-unit, e.g. stroops). Accrual begins when the stream is **started** and is
-realised on each call to `settle_stream`. The contract is intentionally minimal:
-no pauses, no cliffs, pure linear accrual capped by the deposited balance.
+A StreamPay stream escrows SEP-41-compatible tokens from `payer` to the contract
+at creation time. While the stream is active, value accrues toward `recipient`
+at `rate_per_second`, bounded by the remaining escrowed `balance`.
+
+Settlement is now an accounting step, not the final token transfer:
+
+```text
+settle_stream  -> balance -= accrued, claimable_balance += accrued
+withdraw_stream -> transfer claimable_balance from contract to recipient
+```
+
+This replaces the older v0.1 text that described no token transfers, no pause
+surface, and no claimable pool.
 
 ---
 
-## 2. State Variables
+## 2. Stream State
 
-Each stream stores the following fields (see `StreamInfo`):
+`StreamInfo` stores the operational state for one stream:
 
-| Field | Type | Description |
-|---|---|---|
-| `payer` | `Address` | Account that funds the stream and controls it |
-| `recipient` | `Address` | Beneficiary of the streamed payments |
-| `rate_per_second` | `i128` | Token units accrued per second; must be > 0 |
-| `balance` | `i128` | Remaining deposited balance; must be > 0 at creation |
-| `start_time` | `u64` | Ledger timestamp (seconds) of the last start or settle |
-| `end_time` | `u64` | Ledger timestamp (seconds) when the stream was stopped |
-| `is_active` | `bool` | `true` iff the stream is currently streaming |
+| Field | Meaning |
+| --- | --- |
+| `payer` | Account that creates, funds, starts, stops, pauses, resumes, cancels, archives, and updates rate. |
+| `recipient` | Account allowed to withdraw claimable tokens. |
+| `token` | SEP-41-compatible token contract used for escrow and withdrawal. |
+| `rate_per_second` | Token units accrued per second; must be positive. |
+| `balance` | Escrowed but not-yet-accrued balance. |
+| `claimable_balance` | Accrued balance owed to recipient but not yet transferred. |
+| `start_time` | Timestamp for the current unsettled accrual window. |
+| `end_time` | Timestamp recorded when the stream is stopped/cancelled. |
+| `is_active` | Whether the stream is running or logically paused. |
 
-> **Note on `start_time` semantics.** After each `settle_stream` call,
-> `start_time` is **reset to `now`**. It therefore represents the beginning of
-> the *current unsettled window*, not the stream's original creation time.
+The core accounting invariant is:
+
+```text
+balance + claimable_balance <= initial_deposit
+```
+
+`create_stream` transfers `initial_balance` from the payer into the contract
+before the stream is stored.
 
 ---
 
-## 3. Accrual Formula
+## 3. Linear Accrual Formula
 
-### 3.1 Elapsed Time
+For a running stream with `start_time = T0` and current ledger timestamp `now`:
 
-For a stream that is active and has `start_time = T₀`, queried at ledger
-timestamp `now`:
-
-```
-elapsed = now − start_time
-```
-
-Both values are `u64` seconds from the Soroban ledger clock
-(`env.ledger().timestamp()`). Subtraction is plain unsigned arithmetic; since
-`now ≥ start_time` is guaranteed by the ledger's monotonic clock, no underflow
-can occur.
-
-### 3.2 Raw Accrued Amount
-
-```
-raw_accrued = elapsed × rate_per_second
+```text
+elapsed = now - start_time
+raw_accrued = elapsed * rate_per_second
+accrued = min(raw_accrued, balance)
 ```
 
-This is a **saturating multiply** on `i128`:
+The implementation uses saturating arithmetic:
 
 ```rust
 let amount = (elapsed as i128)
@@ -67,175 +70,92 @@ let amount = (elapsed as i128)
     .min(info.balance);
 ```
 
-`saturating_mul` means that if the product would exceed `i128::MAX`
-(≈ 1.7 × 10³⁸), it clamps to `i128::MAX` rather than wrapping. In practice,
-with `elapsed` in seconds and `rate_per_second` in stroops, overflow is
-unreachable, but the guard is present.
-
-### 3.3 Balance Cap
-
-The accrued amount is capped at the remaining balance:
-
-```
-accrued = min(raw_accrued, balance)
-```
-
-This ensures the stream never pays out more than it holds, even if the stream
-is left running past exhaustion.
-
-### 3.4 Complete Formula (single expression)
-
-```
-accrued(start_time, now, rate_per_second, balance) =
-    min( (now − start_time) × rate_per_second , balance )
-```
-
-All variables are non-negative integers. The result is a non-negative integer
-in the same token-unit as `rate_per_second` and `balance`.
+`rate_per_second` and `initial_balance` are required to be positive at creation.
+The `.min(info.balance)` cap prevents over-accrual even if elapsed time or rate
+is extremely large.
 
 ---
 
-## 4. State Transition on Settlement
+## 4. Settlement
 
-`settle_stream` applies the formula and mutates state atomically:
+`settle_stream(stream_id)` is permissionless. If the stream cannot accrue, it
+returns `0`. Otherwise it:
 
-```
-balance'    = balance − accrued
-start_time' = now
-```
+1. Computes `accrued` for the elapsed window.
+2. Decreases `balance` by `accrued`.
+3. Increases `claimable_balance` by `accrued`.
+4. Advances `start_time` to the settlement boundary.
+5. Returns `accrued`.
 
-In Rust (from `settle_stream`):
-
-```rust
-info.balance = info.balance.saturating_sub(amount);
-info.start_time = now;
-```
-
-`saturating_sub` is used for safety; given the cap in §3.3 it can never
-actually saturate (amount ≤ balance), but the guard is present.
-
-After settlement the stream remains **active**. To stop streaming, the payer
-must call `stop_stream` explicitly.
+`batch_settle` applies the same semantics to up to `MAX_BATCH_SETTLE_SIZE` (25)
+stream ids and is all-or-nothing if an item panics.
 
 ---
 
-## 5. Lifecycle & Formula Applicability
+## 5. Withdrawals
 
-```
-create_stream → [inactive, start_time=0]
-     ↓  start_stream
-[active, start_time=T₁]   ←──────────────────────────────┐
-     ↓  settle_stream(now=T₂)                            │
-[active, start_time=T₂, balance reduced]  ───────────────┘
-     ↓  stop_stream(now=T₃)
-[inactive, end_time=T₃]
-     ↓  settle_stream (no-op: is_active=false → returns 0)
-     ↓  archive_stream (requires balance=0)
-[removed from storage]
-```
+`withdraw_stream(stream_id)` requires recipient auth. It implicitly settles any
+outstanding accrual before transferring tokens, then transfers the whole
+`claimable_balance` from the contract to the recipient and resets
+`claimable_balance` to `0`.
 
-The accrual formula in §3.4 is only evaluated when `is_active = true`.
-When `is_active = false`, `settle_stream` returns `0` immediately without
-touching state.
+For an inactive stream, withdrawal settles the final window from `start_time` to
+`end_time` so a payer cannot stop a stream and strand earned tokens.
+
+Calling `withdraw_stream` with no claimable amount is idempotent and returns `0`.
 
 ---
 
-## 6. Worked Examples
+## 6. Stop, Pause, Resume, Cancel
 
-### Example 1 — Partial settlement
+| Entry point | Effect |
+| --- | --- |
+| `stop_stream` | Payer-auth. Marks the stream inactive and records `end_time`. Final earned value is handled by withdrawal. |
+| `pause_stream` | Payer-auth. Settles accrued value up to pause, keeps the stream logically active, and stores `paused_at`. |
+| `resume_stream` | Payer-auth. Requires `paused_at != 0`, clears it, and restarts accrual from the current ledger timestamp. |
+| `cancel_stream` | Payer-auth. Requires active stream, settles accrued value, marks inactive, and records `end_time`. |
 
-```
+Pause/resume is distinct from stop: pause is resumable; stop is the inactive
+terminal state before final withdrawal/archive.
+
+---
+
+## 7. Archival
+
+`archive_stream` requires payer auth and only succeeds when:
+
+- `is_active == false`
+- `balance == 0`
+- `claimable_balance == 0`
+
+The `claimable_balance` guard ensures the recipient has withdrawn earned tokens
+before the stream record is removed.
+
+---
+
+## 8. Worked Example
+
+```text
+initial_balance = 1_000
 rate_per_second = 10
-balance         = 1_000
-start_time      = 1_000_000   (Unix-style seconds, Soroban ledger)
-now             = 1_000_050   (50 seconds later)
+start_time = 100
+now = 150
 
-elapsed         = 1_000_050 − 1_000_000 = 50
-raw_accrued     = 50 × 10 = 500
-accrued         = min(500, 1_000) = 500
-
-balance'        = 1_000 − 500 = 500
-start_time'     = 1_000_050
+elapsed = 50
+accrued = min(50 * 10, 1_000) = 500
+balance' = 500
+claimable_balance' = 500
+start_time' = 150
 ```
 
-### Example 2 — Balance exhaustion (cap fires)
-
-```
-rate_per_second = 100
-balance         = 1_000
-start_time      = 0
-now             = 20   (20 seconds later)
-
-elapsed         = 20 − 0 = 20
-raw_accrued     = 20 × 100 = 2_000
-accrued         = min(2_000, 1_000) = 1_000   ← cap fires
-
-balance'        = 1_000 − 1_000 = 0
-start_time'     = 20
-```
-
-This mirrors `test_archive_settled_stream` in the test suite:
-`rate=100, balance=1_000, elapsed=10 → amount=1_000`.
-
-### Example 3 — Zero elapsed (same ledger timestamp)
-
-```
-rate_per_second = 50
-balance         = 5_000
-start_time      = 42
-now             = 42   (settle called in same ledger second)
-
-elapsed         = 0
-raw_accrued     = 0 × 50 = 0
-accrued         = min(0, 5_000) = 0
-
-balance'        = 5_000   (unchanged)
-start_time'     = 42      (unchanged in effect)
-```
-
-### Example 4 — Multiple sequential settlements
-
-```
-rate_per_second = 10
-balance         = 300
-
-Settlement 1: start_time=0,  now=10  → accrued=100, balance=200, start_time'=10
-Settlement 2: start_time=10, now=20  → accrued=100, balance=100, start_time'=20
-Settlement 3: start_time=20, now=30  → accrued=100, balance=0,   start_time'=30
-Settlement 4: start_time=30, now=40  → accrued=min(100,0)=0,    balance=0
-```
+If the recipient immediately calls `withdraw_stream`, `500` token units are
+transferred from the contract to the recipient and `claimable_balance` returns
+to `0`.
 
 ---
 
-## 7. Constraints and Invariants
+## 9. Related Specifications
 
-| Invariant | Source |
-|---|---|
-| `rate_per_second > 0` | Enforced by `create_stream` panic |
-| `balance > 0` at creation | Enforced by `create_stream` panic |
-| `balance ≥ 0` always | `saturating_sub` + cap guarantee |
-| `accrued ≤ balance` | `min(raw, balance)` in §3.3 |
-| `start_time` monotonically non-decreasing | Reset to `now` on settle; ledger clock is monotonic |
-| Archival only when `balance = 0` and `is_active = false` | `archive_stream` guards |
-
----
-
-## 8. What This Spec Does NOT Cover
-
-The current implementation (`v0.1.0`) deliberately omits:
-
-- **Pauses** — there is no pause/resume mechanism; `stop_stream` is terminal
-  until a new `start_stream` call.
-- **Cliffs** — accrual begins immediately from `start_time`; no cliff period.
-- **Token transfers** — `settle_stream` updates the on-chain balance field but
-  does not invoke a token contract transfer. Actual disbursement is handled at
-  the application layer.
-- **Multi-asset streams** — a single stream carries a single implicit asset.
-
----
-
-## 9. Version History
-
-| Version | Change |
-|---|---|
-| 0.1.0 | Initial specification; linear accrual, no pauses or cliffs |
+- `docs/vesting.md` documents the linear vesting helper and tests.
+- `docs/error-codes.md` lists the current panic strings emitted by the contract.
+- `docs/pause-resume.md` covers the pause/resume lifecycle in more depth.
